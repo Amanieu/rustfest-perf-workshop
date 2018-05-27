@@ -5,6 +5,7 @@ authors = ["Jef <jackefransham@gmail.com>"]
 
 [dependencies]
 combine = "3.2.0"
+fxhash = "*"
 
 [profile.bench]
 debug = true

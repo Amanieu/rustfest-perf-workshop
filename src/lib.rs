@@ -2,26 +2,323 @@
 
 #[macro_use]
 extern crate combine;
+extern crate fxhash;
 
-use std::collections::HashMap;
+use fxhash::FxHashMap;
+use std::{fmt, mem};
 
-#[derive(Clone)]
-pub enum Ast {
-    Lit(Value),
-    Variable(String),
-    Call(Box<Ast>, Vec<Ast>),
-    Define(String, Box<Ast>),
-}
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct Ident(usize);
 
-#[derive(Clone)]
+#[derive(Copy, Clone)]
 pub enum Value {
     Void,
     False,
     Int(u64),
-    Function(Vec<String>, Vec<Ast>),
-    InbuiltFunc(fn(Vec<Value>) -> Value),
+    Code(usize),
+    InbuiltFunc(fn(&[Value]) -> Value),
 }
 
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Value::Void => write!(f, "Void"),
+            Value::False => write!(f, "False"),
+            Value::Int(x) => write!(f, "Int({})", x),
+            Value::Code(x) => write!(f, "Code({})", x),
+            Value::InbuiltFunc(_) => write!(f, "InbuiltFunc"),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum Opcode {
+    Lit(Value),
+    ReadVar(Ident),
+    WriteVar(Ident),
+    Call { num_args: usize, ret_addr: usize },
+    Return,
+    DropVal,
+    End,
+}
+
+#[derive(Clone, Debug)]
+pub struct Variables<'a> {
+    idents: FxHashMap<&'a str, Ident>,
+    variables: Vec<Option<(Value, usize)>>,
+}
+impl<'a> Variables<'a> {
+    pub fn new() -> Variables<'a> {
+        Variables {
+            idents: FxHashMap::default(),
+            variables: Vec::new(),
+        }
+    }
+    pub fn ident(&mut self, s: &'a str) -> Ident {
+        let new_ident = Ident(self.variables.len());
+        let variables = &mut self.variables;
+        *self.idents.entry(s).or_insert_with(|| {
+            variables.resize(new_ident.0 + 1, Default::default());
+            new_ident
+        })
+    }
+    pub fn set_var(&mut self, var: &'a str, val: Value) {
+        let ident = self.ident(var);
+        self.set(ident, val, 0);
+    }
+
+    pub fn set(&mut self, ident: Ident, val: Value, scope: usize) -> Option<(Value, usize)> {
+        mem::replace(&mut self.variables[ident.0], Some((val, scope)))
+    }
+
+    pub fn get(&self, ident: Ident, scope_depth: usize) -> Value {
+        match self.variables.get(ident.0).and_then(|x| *x) {
+            Some(v) if v.1 <= scope_depth => v.0,
+            _ => panic!("Variable does not exist: {:?}\n{:#?}", ident, self),
+        }
+    }
+}
+
+pub struct CompileContext<'a> {
+    code: Vec<Vec<Opcode>>,
+    current_block: usize,
+    variables: Variables<'a>,
+}
+
+impl<'a> CompileContext<'a> {
+    fn emit(&mut self, op: Opcode) {
+        let block = self.current_block;
+        self.code[block].push(op);
+    }
+
+    pub fn compile(program: &[Ast<'a>], variables: Variables<'a>) -> RunContext<'a> {
+        let mut ctx = CompileContext {
+            code: vec![Vec::new()],
+            current_block: 0,
+            variables,
+        };
+        ctx.emit(Opcode::Lit(Value::Void));
+        for ast in program {
+            ctx.emit(Opcode::DropVal);
+            ctx.compile_subtree(ast);
+        }
+        ctx.emit(Opcode::End);
+        let code = ctx.optimize();
+        RunContext {
+            code,
+            stack: Vec::new(),
+            ret_stack: Vec::new(),
+            variables: ctx.variables,
+        }
+    }
+
+    fn optimize(&mut self) -> Vec<Opcode> {
+        // Eliminate literals followed by DropValue
+        for block in &mut self.code {
+            let mut i = 0;
+            while i < block.len() - 1 {
+                if let Opcode::Lit(_) = block[i] {
+                    if let Opcode::DropVal = block[i + 1] {
+                        block.drain(i..i + 2);
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+
+        // Move all the code into a single Vec
+        let mut offsets = Vec::with_capacity(self.code.len());
+        let mut pos = 0;
+        for block in &self.code {
+            offsets.push(pos);
+            pos += block.len();
+        }
+        for block in &mut self.code {
+            for op in block.iter_mut() {
+                match op {
+                    Opcode::Lit(Value::Code(ref mut target)) => *target = offsets[*target],
+                    Opcode::Call {
+                        ref mut ret_addr, ..
+                    } => *ret_addr = offsets[*ret_addr],
+                    _ => {}
+                }
+            }
+            offsets.push(pos);
+            pos += block.len();
+        }
+        self.code
+            .iter()
+            .flat_map(|block| block.iter())
+            .map(|x| *x)
+            .collect()
+    }
+
+    fn compile_subtree(&mut self, tree: &Ast<'a>) {
+        match tree {
+            Ast::Lit(val) => {
+                let val = match val {
+                    AstValue::Void => Value::Void,
+                    AstValue::False => Value::False,
+                    AstValue::Int(x) => Value::Int(*x),
+                    AstValue::Function(args, ast) => {
+                        let prev_block = self.current_block;
+                        let new_block = self.code.len();
+                        self.code.push(Vec::new());
+                        self.current_block = new_block;
+
+                        for arg in args.into_iter().rev() {
+                            let ident = self.variables.ident(arg);
+                            self.emit(Opcode::WriteVar(ident));
+                        }
+                        self.emit(Opcode::Lit(Value::Void));
+                        for ast in ast {
+                            self.emit(Opcode::DropVal);
+                            self.compile_subtree(ast);
+                        }
+                        self.emit(Opcode::Return);
+
+                        self.current_block = prev_block;
+                        Value::Code(new_block)
+                    }
+                    AstValue::InbuiltFunc(f) => Value::InbuiltFunc(*f),
+                };
+                self.emit(Opcode::Lit(val));
+            }
+            Ast::Variable(name) => {
+                let ident = self.variables.ident(name);
+                self.emit(Opcode::ReadVar(ident));
+            }
+            Ast::Call(func, arguments) => {
+                let ret_addr = self.code.len();
+                self.code.push(Vec::new());
+
+                let num_args = arguments.len();
+                self.compile_subtree(func);
+                for ast in arguments {
+                    self.compile_subtree(ast);
+                }
+                self.emit(Opcode::Call { num_args, ret_addr });
+
+                self.current_block = ret_addr;
+            }
+            Ast::Define(name, value) => {
+                self.compile_subtree(value);
+                let ident = self.variables.ident(name);
+                self.emit(Opcode::WriteVar(ident));
+                self.emit(Opcode::Lit(Value::Void));
+            }
+        }
+    }
+}
+
+enum ScopeStack {
+    ReturnAddress(usize),
+    RestoreIdent(Ident, Value, usize),
+}
+
+pub struct RunContext<'a> {
+    code: Vec<Opcode>,
+    stack: Vec<Value>,
+    ret_stack: Vec<ScopeStack>,
+    variables: Variables<'a>,
+}
+
+impl<'a> RunContext<'a> {
+    pub fn run(&mut self) -> Value {
+        let mut pc = 0;
+        let mut scope_depth = 1;
+        loop {
+            match self.code[pc] {
+                Opcode::Lit(val) => {
+                    self.stack.push(val);
+                    pc += 1;
+                }
+                Opcode::ReadVar(ident) => {
+                    let val = self.variables.get(ident, scope_depth);
+                    self.stack.push(val);
+                    pc += 1;
+                }
+                Opcode::WriteVar(ident) => {
+                    let val = self.stack.pop().expect("Operand stack underflow");
+                    if let Some((old_val, old_scope)) = self.variables.set(ident, val, scope_depth)
+                    {
+                        self.ret_stack
+                            .push(ScopeStack::RestoreIdent(ident, old_val, old_scope));
+                    }
+                    pc += 1;
+                }
+                Opcode::Call { num_args, ret_addr } => {
+                    let stack_top = self.stack.len();
+                    let args_start = stack_top - num_args;
+                    let target = *self.stack
+                        .get(args_start - 1)
+                        .expect("Operand stack underflow");
+                    match target {
+                        Value::Code(target) => {
+                            self.ret_stack.push(ScopeStack::ReturnAddress(ret_addr));
+                            scope_depth += 1;
+                            pc = target;
+                        }
+                        Value::InbuiltFunc(f) => {
+                            let result = f(&self.stack[args_start..]);
+                            self.stack.truncate(args_start);
+                            self.stack[args_start - 1] = result;
+                            pc = ret_addr;
+                        }
+                        _ => panic!("Attempted to call a non-function"),
+                    }
+                }
+                Opcode::Return => {
+                    let result = self.stack.pop().expect("Operand stack underflow");
+                    *self.stack.last_mut().expect("Operand stack underflow") = result;
+                    scope_depth -= 1;
+                    let ret_addr = loop {
+                        match self.ret_stack.pop().expect("Return stack underflow") {
+                            ScopeStack::ReturnAddress(r) => break r,
+                            ScopeStack::RestoreIdent(ident, val, depth) => {
+                                self.variables.set(ident, val, depth);
+                            }
+                        }
+                    };
+                    pc = ret_addr;
+                }
+                Opcode::DropVal => {
+                    self.stack.pop().expect("Operand stack underflow");
+                    pc += 1;
+                }
+                Opcode::End => {
+                    while let Some(x) = self.ret_stack.pop() {
+                        match x {
+                            ScopeStack::ReturnAddress(r) => unreachable!(),
+                            ScopeStack::RestoreIdent(ident, val, depth) => {
+                                self.variables.set(ident, val, depth);
+                            }
+                        }
+                    }
+                    return self.stack.pop().expect("Operand stack underflow");
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum Ast<'a> {
+    Lit(AstValue<'a>),
+    Variable(&'a str),
+    Call(Box<Ast<'a>>, Vec<Ast<'a>>),
+    Define(&'a str, Box<Ast<'a>>),
+}
+
+#[derive(Clone)]
+pub enum AstValue<'a> {
+    Void,
+    False,
+    Int(u64),
+    Function(Vec<&'a str>, Vec<Ast<'a>>),
+    InbuiltFunc(fn(&[Value]) -> Value),
+}
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         use Value::*;
@@ -35,7 +332,8 @@ impl PartialEq for Value {
     }
 }
 
-pub fn eval(program: Ast, variables: &mut HashMap<String, Value>) -> Value {
+/*
+pub fn eval<'a>(program: Ast<'a>, variables: &mut HashMap<&'a str, Value<'a>>) -> Value<'a> {
     use self::Ast::*;
     use self::Value::*;
 
@@ -43,7 +341,7 @@ pub fn eval(program: Ast, variables: &mut HashMap<String, Value>) -> Value {
         Lit(val) => val,
         Variable(name) => match variables.get(&name) {
             Some(v) => v.clone(),
-            _ => panic!("Variable does not exist: {}", &name),
+            _ => panic!("Variable does not exist: {}", name),
         },
         Call(func, arguments) => {
             let func = eval(*func, variables);
@@ -89,9 +387,14 @@ pub fn eval(program: Ast, variables: &mut HashMap<String, Value>) -> Value {
         }
     }
 }
+*/
 
 parser! {
-    pub fn expr[I]()(I) -> Ast where [I: combine::Stream<Item = char>] {
+    pub fn expr['a, I]()(I) -> Ast<'a> where [
+        I: combine::Stream<Item = char, Range = &'a str> +
+        combine::RangeStreamOnce
+    ] {
+        use combine::parser::range::recognize;
         use combine::parser::char::*;
         use combine::*;
 
@@ -107,16 +410,16 @@ parser! {
 
         let lambda = char('\\');
         let eq = char('=');
-        let flse = white!(string("#f")).map(|_| Ast::Lit(::Value::False));
-        let ident = || white!(many1::<String, _>(letter()));
+        let flse = white!(string("#f")).map(|_| Ast::Lit(::AstValue::False));
+        let ident = || white!(recognize(skip_many1(letter())).map(|chars: &'a str| chars));
         let function = (
             white!(lambda),
             white!(between(char('('), char(')'), many::<Vec<_>, _>(ident()))),
             many::<Vec<_>, _>(expr()),
-        ).map(|(_, a, b)| Ast::Lit(::Value::Function(a, b)));
+        ).map(|(_, a, b)| Ast::Lit(::AstValue::Function(a, b)));
         let define = (white!(eq), ident(), expr()).map(|(_, a, b)| Ast::Define(a, Box::new(b)));
         let lit_num = many1::<String, _>(digit())
-            .map(|i| Ast::Lit(::Value::Int(i.parse().expect("Parsing integer failed"))));
+            .map(|i| Ast::Lit(::AstValue::Int(i.parse().expect("Parsing integer failed"))));
         let call = (expr(), many(expr())).map(|(func, args)| Ast::Call(Box::new(func), args));
 
         white!(choice!(
@@ -136,14 +439,19 @@ mod benches {
 
     use self::test::{black_box, Bencher};
 
-    use super::{eval, expr, Value};
+    use super::{expr, Ast, CompileContext, Value, Variables};
+
+    fn eval(b: &mut Bencher, program: &[Ast], env: Variables) {
+        let mut compiled = CompileContext::compile(program, env);
+        b.iter(|| black_box(compiled.run()));
+    }
 
     // First we need some helper functions. These are used with the `InbuiltFunc`
     // constructor and act as native functions, similar to how you'd add functions
     // to the global namespace in Lua.
     //
     // This one simply sums the arguments.
-    fn add(variables: Vec<Value>) -> Value {
+    fn add(variables: &[Value]) -> Value {
         let mut out = 0u64;
 
         for v in variables {
@@ -159,9 +467,9 @@ mod benches {
     // This one checks the arguments for equality. I used `Void` to represent true
     // and `False` to represent false. This is mostly inspired by scheme, where
     // everything is true except for `#f`.
-    fn eq(mut variables: Vec<Value>) -> Value {
-        if let Some(last) = variables.pop() {
-            for v in variables {
+    fn eq(mut variables: &[Value]) -> Value {
+        if let Some((last, rest)) = variables.split_last() {
+            for v in rest {
                 if v != last {
                     return Value::False;
                 }
@@ -177,18 +485,18 @@ mod benches {
     // other programming language in existence. To do lazy evaluation you make
     // the `then` and `else` branches return functions and then call the
     // functions.
-    fn if_(variables: Vec<Value>) -> Value {
+    fn if_(variables: &[Value]) -> Value {
         let mut iter = variables.into_iter();
         let (first, second, third) = (
             iter.next().expect("No condition for if"),
             iter.next().expect("No body for if"),
-            iter.next().unwrap_or(Value::Void),
+            iter.next().unwrap_or(&Value::Void),
         );
         assert!(iter.next().is_none(), "Too many arguments supplied to `if`");
 
         match first {
-            Value::False => third,
-            _ => second,
+            Value::False => *third,
+            _ => *second,
         }
     }
 
@@ -338,75 +646,62 @@ someval
     // our testing code needs in order to run.
     #[bench]
     fn run_deep_nesting(b: &mut Bencher) {
-        use std::collections::HashMap;
-
         // This just returns a function so `((whatever))` (equivalent
         // to `(whatever())()`) does something useful. Specifically
         // it just returns itself. We try to do as little work as
         // possible here so that our benchmark is still testing the
         // interpreter and not this function.
-        fn callable(_: Vec<Value>) -> Value {
+        fn callable(_: &[Value]) -> Value {
             Value::InbuiltFunc(callable)
         }
 
-        let mut env = HashMap::new();
-        env.insert("test".to_owned(), Value::InbuiltFunc(callable));
+        let mut env = Variables::new();
+        env.set_var("test", Value::InbuiltFunc(callable));
 
         let (program, _) = expr().easy_parse(DEEP_NESTING).unwrap();
 
-        b.iter(|| black_box(eval(program.clone(), &mut env)));
+        eval(b, &[program], env);
     }
 
     #[bench]
     fn run_real_code(b: &mut Bencher) {
-        use std::collections::HashMap;
+        let mut env = Variables::new();
 
-        let mut env = HashMap::new();
-
-        env.insert("eq".to_owned(), Value::InbuiltFunc(eq));
-        env.insert("add".to_owned(), Value::InbuiltFunc(add));
-        env.insert("if".to_owned(), Value::InbuiltFunc(if_));
+        env.set_var("eq", Value::InbuiltFunc(eq));
+        env.set_var("add", Value::InbuiltFunc(add));
+        env.set_var("if", Value::InbuiltFunc(if_));
 
         let (program, _) = ::combine::many1::<Vec<_>, _>(expr())
             .easy_parse(REAL_CODE)
             .unwrap();
 
-        b.iter(|| {
-            let mut env = env.clone();
-            for line in &program {
-                black_box(eval(line.clone(), &mut env));
-            }
-        });
+        eval(b, &program, env);
     }
 
     #[bench]
     fn run_many_variables(b: &mut Bencher) {
-        use std::collections::HashMap;
-
         // This just takes anything and returns `Void`. We just
         // want a function that can take any number of arguments
         // but we don't want that function to do anything useful
         // since, again, the benchmark should be of the
         // interpreter's code.
-        fn ignore(_: Vec<Value>) -> Value {
+        fn ignore(_: &[Value]) -> Value {
             Value::Void
         }
 
         let (program, _) = expr().easy_parse(MANY_VARIABLES).unwrap();
 
-        let mut env = HashMap::new();
+        let mut env = Variables::new();
 
-        env.insert("ignore".to_owned(), Value::InbuiltFunc(ignore));
+        env.set_var("ignore", Value::InbuiltFunc(ignore));
 
-        b.iter(|| black_box(eval(program.clone(), &mut env)));
+        eval(b, &[program], env);
     }
 
     #[bench]
     fn run_nested_func(b: &mut Bencher) {
-        use std::collections::HashMap;
-
         let (program, _) = expr().easy_parse(NESTED_FUNC).unwrap();
-        let mut env = HashMap::new();
-        b.iter(|| black_box(eval(program.clone(), &mut env)));
+        let mut env = Variables::new();
+        eval(b, &[program], env);
     }
 }
